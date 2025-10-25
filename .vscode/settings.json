@@ -1,0 +1,14 @@
+{
+    // Repository-level VS Code settings to enforce 4-space indentation
+    "editor.insertSpaces": true,
+    "editor.tabSize": 4,
+    // Turn off detection so the repo settings are enforced consistently
+    "editor.detectIndentation": false,
+    // Optional niceties
+    "files.trimTrailingWhitespace": true,
+    "files.insertFinalNewline": true,
+    "editor.formatOnSave": false,
+    "[python]": {
+        "editor.tabSize": 4
+    }
+}
