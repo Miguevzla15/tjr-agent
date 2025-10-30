@@ -6,237 +6,159 @@ import plotly.graph_objects as go
 from datetime import datetime, time
 import pytz
 from streamlit_autorefresh import st_autorefresh
+import requests
 
-# ---------- Page + Auto-refresh ----------
+# --------------------- Streamlit Setup ---------------------
 st.set_page_config(page_title="TJR NY Session Agent", layout="wide")
-# Auto-refresh every 30s to re-evaluate signals and exits
 st_autorefresh(interval=30_000, key="tjr_autorefresh_30s")
 
-# ---------- Timezone + market schedule helpers ----------
+# --------------------- Timezone ---------------------
 NY_TZ = pytz.timezone("America/New_York")
+def now_ny(): return datetime.now(NY_TZ)
 
-def now_ny():
-    return datetime.now(NY_TZ)
-
+# --------------------- Market Hours ---------------------
 def futures_closed_now(dt=None):
-    """CME ES/NQ hours: Sun 18:00 → Fri 17:00 ET, daily break 16:00–17:00 ET."""
-    if dt is None:
-        dt = now_ny()
-    wd = dt.weekday()  # 0=Mon ... 4=Fri, 5=Sat, 6=Sun
-    t = dt.time()
-
-    # Daily maintenance break (no new bars)
-    if time(16, 0) <= t < time(17, 0):
-        return True
-    # Weekend close: Fri 17:00 → Sun 18:00
-    if wd == 4 and t >= time(17, 0):  # Fri after 5pm ET
-        return True
-    if wd == 5:                        # Saturday
-        return True
-    if wd == 6 and t < time(18, 0):    # Sunday before 6pm ET
-        return True
+    if dt is None: dt = now_ny()
+    wd, t = dt.weekday(), dt.time()
+    if time(16, 0) <= t < time(17, 0): return True
+    if wd == 4 and t >= time(17, 0): return True
+    if wd == 5: return True
+    if wd == 6 and t < time(18, 0): return True
     return False
 
-# ---------- Data fetch ----------
-def fetch_intraday(symbol, days=3, interval="5m"):
-    """Fetch intraday/daily data, localize to NY time, return (df, age_min)."""
-    prepost = not (time(9, 30) <= now_ny().time() <= time(16, 0))
-    df = yf.download(symbol, period=f"{days}d", interval=interval,
-                     prepost=prepost, progress=False)
-    if df is None or df.empty:
-        return pd.DataFrame(), 9999
-
-    # Normalize tz + columns
-    if not df.index.tz:
-        df.index = df.index.tz_localize("UTC")
+# --------------------- Fetch OHLC ---------------------
+def _sanitize_ohlc(raw):
+    if raw is None or raw.empty: return pd.DataFrame()
+    df = raw.copy()
+    if not df.index.tz: df.index = df.index.tz_localize("UTC")
     df.index = df.index.tz_convert(NY_TZ)
-    df.rename(columns=str.lower, inplace=True)
+    df.columns = [str(c).lower() for c in df.columns]
+    try:
+        out = pd.DataFrame({
+            "open": pd.to_numeric(df["open"], errors="coerce"),
+            "high": pd.to_numeric(df["high"], errors="coerce"),
+            "low": pd.to_numeric(df["low"], errors="coerce"),
+            "close": pd.to_numeric(df["close"], errors="coerce")
+        }, index=df.index)
+        return out.dropna()
+    except KeyError:
+        return pd.DataFrame()
 
-    age_min = (now_ny() - df.index[-1]).total_seconds() / 60
-    return df, age_min
+def fetch_intraday(symbol, days=3, interval="5m"):
+    prepost = not (time(9, 30) <= now_ny().time() <= time(16, 0))
+    try:
+        raw = yf.download(symbol, period=f"{days}d", interval=interval, prepost=prepost, progress=False)
+    except Exception:
+        return pd.DataFrame(), 9999
+    df = _sanitize_ohlc(raw)
+    age = (now_ny() - df.index[-1]).total_seconds() / 60.0 if not df.empty else 9999
+    return df, age
 
-def fetch_best(ticker: str):
-    """Try 5m → 15m → 1h → 1d. Return (df, age_min, used_interval)."""
-    for interval, days in [("5m", 10), ("15m", 30), ("1h", 180), ("1d", 365)]:
-        df, age = fetch_intraday(ticker, days=days, interval=interval)
-        if df is None or df.empty:
-            continue
-        if "close" not in df.columns:
-            continue
-        close = df["close"]
-        if isinstance(close, pd.DataFrame):
-            close = close.iloc[:, 0]
-        close = pd.to_numeric(close, errors="coerce")
-        if close.isna().all():
-            continue
-        df["close"] = close
-        return df, age, interval
+def fetch_best(ticker):
+    for interval, days in [("5m", 5), ("15m", 20), ("1h", 60), ("1d", 365)]:
+        df, age = fetch_intraday(ticker, days, interval)
+        if not df.empty: return df, age, interval
     return pd.DataFrame(), 9999, None
 
-# ---------- Sessions + signals ----------
-def mark_sessions(df):
-    asia = df.between_time("19:00", "23:59")
-    london = df.between_time("03:00", "07:00")
-    return asia, london
+# --------------------- Pattern Detection ---------------------
+def detect_candle_patterns(df):
+    if len(df) < 2:
+        return []
+    last = df.iloc[-2]
+    curr = df.iloc[-1]
+    patterns = []
 
-def detect_sweep_choch(df):
-    """Detect a simple SMC-style sweep → CHOCH confirmation."""
-    if len(df) < 50:
-        return "WAIT", "Not enough candles yet."
-    recent = df.tail(30)
-    high = float(recent["high"].max())
-    low  = float(recent["low"].min())
-    last_close = float(df["close"].iloc[-1])
-    last_high  = float(df["high"].iloc[-1])
-    last_low   = float(df["low"].iloc[-1])
+    if last["close"] < last["open"] and curr["close"] > curr["open"] and curr["close"] > last["open"] and curr["open"] < last["close"]:
+        patterns.append("Bullish Engulfing")
+    if last["close"] > last["open"] and curr["close"] < curr["open"] and curr["open"] > last["close"] and curr["close"] < last["open"]:
+        patterns.append("Bearish Engulfing")
+    if curr["close"] > curr["open"] and (curr["close"] - curr["open"]) < (curr["high"] - curr["low"]) * 0.3:
+        patterns.append("Doji")
 
-    # Sweep above highs + reject
-    if (last_close < high * 0.999) and (last_high >= high):
-        return "SELL", "Sweep above highs → CHOCH down."
-    # Sweep below lows + reject
-    if (last_close > low * 1.001) and (last_low <= low):
-        return "BUY", "Sweep below lows → CHOCH up."
-    return "WAIT", "No liquidity sweep detected."
+    return patterns
 
-# ---------- Trade plan + exit tracking ----------
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Wilder ATR."""
+# --------------------- Trade Plan Logic ---------------------
+def atr(df, period=14):
     h, l, c = df["high"], df["low"], df["close"]
     prev_c = c.shift(1)
     tr = pd.concat([(h - l), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
-def compute_trade_plan(df: pd.DataFrame, action: str):
-    """
-    Entry = last close; SL = 0.8*ATR; TP1 = 1.5R; TP2 = 3R; BE trigger = +1R.
-    Returns dict or None if WAIT/invalid.
-    """
-    if action not in ("BUY", "SELL") or len(df) < 20:
-        return None
+def build_trade_plan(df, signal):
+    if not signal or len(df) < 30: return None
     recent = df.tail(200)
-    a = atr(recent, period=14).iloc[-1]
-    if not np.isfinite(a) or a <= 0:
-        return None
-
+    a = atr(recent, 14).iloc[-1]
     entry = float(recent["close"].iloc[-1])
     R = float(a * 0.8)
+    if "Bullish" in signal:
+        return {"side": "long", "entry": round(entry, 2), "stop_loss": round(entry - R, 2),
+                "tp1 (1.5R)": round(entry + 1.5 * R, 2), "tp2 (3R)": round(entry + 3.0 * R, 2),
+                "breakeven": round(entry + R, 2), "R": round(R, 2)}
+    elif "Bearish" in signal:
+        return {"side": "short", "entry": round(entry, 2), "stop_loss": round(entry + R, 2),
+                "tp1 (1.5R)": round(entry - 1.5 * R, 2), "tp2 (3R)": round(entry - 3.0 * R, 2),
+                "breakeven": round(entry - R, 2), "R": round(R, 2)}
+    return None
 
-    if action == "BUY":
-        sl, tp1, tp2, be, side = entry - R, entry + 1.5*R, entry + 3.0*R, entry + 1.0*R, "long"
+def check_trade_status(df, plan):
+    price = float(df["close"].iloc[-1])
+    if plan["side"] == "long":
+        if price >= plan["tp2 (3R)"]: return "TP2 hit ✅"
+        if price >= plan["tp1 (1.5R)"]: return "TP1 hit 🟢"
+        if price <= plan["stop_loss"]: return "Stop hit 🔴"
     else:
-        sl, tp1, tp2, be, side = entry + R, entry - 1.5*R, entry - 3.0*R, entry - 1.0*R, "short"
+        if price <= plan["tp2 (3R)"]: return "TP2 hit ✅"
+        if price <= plan["tp1 (1.5R)"]: return "TP1 hit 🟢"
+        if price >= plan["stop_loss"]: return "Stop hit 🔴"
+    return "Active"
 
-    return {
-        "side": side,
-        "entry": round(entry, 2),
-        "stop_loss": round(sl, 2),
-        "tp1 (1.5R)": round(tp1, 2),
-        "tp2 (3R)": round(tp2, 2),
-        "breakeven trigger (+1R)": round(be, 2),
-        "R (risk unit)": round(R, 2),
-    }
+# --------------------- Discord ---------------------
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1431788585249669211/c4IBMH2qChcZbek-TJSw00k7XjBIbeUAvUE30TUEfilr76ENCh5TUh5nZ6gM_HlETvCC"
+def send_discord(content):
+    if DISCORD_WEBHOOK_URL:
+        try: requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=8)
+        except Exception as e: st.warning(f"Discord failed: {e}")
 
-def check_trade_progress(df: pd.DataFrame, plan: dict) -> str:
-    """Return a message describing current exit state vs TP1/TP2/SL."""
-    last_price = float(df["close"].iloc[-1])
-    side = plan["side"]
-    tp1 = plan["tp1 (1.5R)"]
-    tp2 = plan["tp2 (3R)"]
-    sl  = plan["stop_loss"]
+# --------------------- Streamlit UI ---------------------
+st.title("TJR NY Session Master Agent — Smart AI Pattern Recognition")
+st.caption("Scanning SPY & QQQ all session long.")
 
-    if side == "long":
-        if last_price >= tp2: return "TP2 hit — close remaining position ✅"
-        if last_price >= tp1: return "TP1 hit — partials + move stop to breakeven 🟢"
-        if last_price <= sl:  return "Stop Loss hit — exit trade 🔴"
-    else:
-        if last_price <= tp2: return "TP2 hit — close remaining position ✅"
-        if last_price <= tp1: return "TP1 hit — partials + move stop to breakeven 🟢"
-        if last_price >= sl:  return "Stop Loss hit — exit trade 🔴"
-    return "Holding — no exit yet ⏳"
+assets = {"S&P 500": "SPY", "Nasdaq 100": "QQQ"}
+if "last_alerts" not in st.session_state:
+    st.session_state.last_alerts = {}
 
-# ---------- Chart ----------
-def plot_chart(df, asia, london, title):
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=df.index, open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="Price"
-    ))
-    for sess, color in [(asia, "rgba(0,255,255,0.08)"), (london, "rgba(255,255,0,0.08)")]:
-        if not sess.empty:
-            fig.add_vrect(x0=sess.index[0], x1=sess.index[-1],
-                          fillcolor=color, layer="below", line_width=0)
-    fig.update_layout(title=title, xaxis_rangeslider_visible=False, height=500)
-    st.plotly_chart(fig, use_container_width=True)
+for name, symbol in assets.items():
+    st.subheader(name)
+    df, age, interval = fetch_best(symbol)
+    st.caption(f"DEBUG: {symbol} | Interval: {interval} | Age: {age:.1f} min | Rows: {len(df)}")
 
-# ---------- UI ----------
-st.title("📊 TJR NY Session Agent (5-Min Charts)")
-st.caption("Analyzes S&P 500 and Nasdaq 100 during NY session using TJR Smart Money Concepts.")
-
-symbols = {"S&P 500": "ES=F", "Nasdaq 100": "NQ=F"}
-
-for label, ticker in symbols.items():
-    st.subheader(label)
-
-    # Market-hours banner
-    if futures_closed_now():
-        st.info("Markets are closed (CME equity futures paused). New 5-min candles resume Sunday 6:00 pm ET.")
-
-    # Fetch with fallbacks (5m → 15m → 1h → 1d)
-    df, age, used_interval = fetch_best(ticker)
     if df.empty:
-        st.warning(f"No data available for {label}. Try again during market hours.")
-        st.divider()
+        st.warning("⚠️ No chart data.")
         continue
 
-    # Freshness
-    if used_interval in ("5m", "15m", "1h"):
-        freshness = f"Data age: {age:.1f} min"
-        if age > 10:
-            st.error(f"{freshness} (stale)")
-        elif age > 3:
-            st.warning(f"{freshness} (slightly delayed)")
-        else:
-            st.success(f"{freshness} (live)")
-    else:
-        st.info("Showing daily candles (intraday unavailable).")
+    patterns = detect_candle_patterns(df)
+    if patterns:
+        plan = build_trade_plan(df, ", ".join(patterns))
+        if plan:
+            msg = (
+                f"📈 {name} Signal\n"
+                f"Pattern: {', '.join(patterns)}\n"
+                f"Entry: {plan['entry']} | SL: {plan['stop_loss']} | TP1: {plan['tp1 (1.5R)']} | TP2: {plan['tp2 (3R)']}"
+            )
+            if st.session_state.last_alerts.get(name) != msg:
+                send_discord(msg)
+                st.session_state.last_alerts[name] = msg
+            st.write(msg)
+            st.dataframe(pd.DataFrame([plan]))
+            st.success(check_trade_status(df, plan))
 
-    # Sessions
-    if used_interval in ("5m", "15m", "1h"):
-        asia, london = mark_sessions(df)
-    else:
-        asia, london = pd.DataFrame(), pd.DataFrame()
+    fig = go.Figure(data=[go.Candlestick(
+        x=df.index, open=df["open"], high=df["high"], low=df["low"], close=df["close"]
+    )])
+    fig.update_layout(title=f"{name} — {interval} Chart", height=400)
+    st.plotly_chart(fig, use_container_width=True)
 
-    # Signal
-    action, reason = detect_sweep_choch(df)
-
-    # Trade plan + live exit status
-    plan = compute_trade_plan(df, action)
-    if plan:
-        st.markdown("#### Trade Plan (ATR-based)")
-        st.dataframe(pd.DataFrame([plan]))
-
-        status_msg = check_trade_progress(df, plan)
-        key = f"status_{label}"
-        prev = st.session_state.get(key)
-        if status_msg != prev:
-            # toast if available; fallback to banner styles
-            try:
-                st.toast(status_msg)
-            except Exception:
-                if "Stop Loss" in status_msg:
-                    st.error(status_msg)
-                elif "TP" in status_msg:
-                    st.success(status_msg)
-                else:
-                    st.info(status_msg)
-            st.session_state[key] = status_msg
-        st.caption(f"Exit status: {status_msg}")
-
-    # Chart + details
-    plot_chart(df.tail(400), asia, london, f"{label} — {used_interval.upper()} View")
-    st.markdown(f"### Signal: {action}")
-    st.caption(reason)
-    st.caption(f"Last update: {now_ny().strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    st.divider()
-
-st.info("✅ 5m/15m/1h intraday via Yahoo Finance. Use during NY session for best results.")
-
+if futures_closed_now():
+    st.warning("🔴 Market Closed — signals paused.")
+else:
+    st.success("🟢 Market Open — AI scanning for patterns and trades.")
